@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Kasatria Assignment — 3D Data Tiles</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+  <!-- THREE.js and CSS3DRenderer (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.142.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.142.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.142.0/examples/js/renderers/CSS3DRenderer.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tween.js/18.6.4/tween.umd.js"></script>
+
+  <!-- small helper for CSV parsing -->
+  <script>
+    // Simple CSV -> array of objects (first row = header)
+    function parseCSV(text) {
+      const lines = text.trim().split(/\r?\n/);
+      if (!lines.length) return [];
+      const headers = lines.shift().split(',').map(h => h.trim());
+      return lines.map(line => {
+        // naive split, assumes no embedded commas in fields; if necessary swap to robust parser
+        const cols = line.split(',').map(c => c.trim());
+        const obj = {};
+        headers.forEach((h, i) => obj[h] = cols[i] === undefined ? '' : cols[i]);
+        return obj;
+      });
+    }
+  </script>
+
+  <style>
+    body { margin: 0; font-family: Inter, system-ui, sans-serif; background: #0f1720; color: #e6eef6; overflow: hidden; }
+    #topbar { position: absolute; left: 12px; top: 12px; z-index: 10; display:flex; gap:8px; align-items:center; }
+    .btn { background:#0b1220; border:1px solid rgba(255,255,255,0.06); color:#dfe7f2; padding:8px 10px; border-radius:8px; cursor:pointer; }
+    .btn:active{ transform: translateY(1px); }
+    #user-info { margin-left:8px; font-size:14px; color:#cfe6ff;}
+    #loading { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:9; font-size:16px; }
+    /* Tiles style */
+    .element {
+      width: 140px;
+      height: 100px;
+      box-sizing: border-box;
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.04);
+      color: #031024;
+      display:flex;
+      flex-direction:column;
+      justify-content:space-between;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+      font-family: system-ui, Arial, sans-serif;
+    }
+    .element .title { font-weight:700; font-size:16px; color:#fff; }
+    .element .subtitle { font-size:12px; opacity:0.95; color:#fff; }
+    .element .small { font-size:12px; opacity:0.9; color:#f7fafc; }
+    /* Controls container */
+    #controls { display:flex; gap:8px; align-items:center; }
+    /* hide until ready */
+    #container { width:100vw; height:100vh; }
+  </style>
+</head>
+<body>
+
+  <div id="topbar">
+    <div id="g_id_onload"
+         data-client_id="557801993386-p0b3mvm51hv63s5mo9954mntjn6qvk6u.apps.googleusercontent.com"
+         data-context="signin"
+         data-ux_mode="popup"
+         data-callback="handleCredentialResponse"
+         data-auto_prompt="false"></div>
+
+    <div class="g_id_signin btn" id="login-btn" style="display:block;">Sign in with Google</div>
+
+    <div id="user-info"></div>
+
+    <div id="controls" style="display:none;">
+      <button class="btn" id="btn-table">Table (20x10)</button>
+      <button class="btn" id="btn-sphere">Sphere</button>
+      <button class="btn" id="btn-helix">Double Helix</button>
+      <button class="btn" id="btn-grid">Grid (5x4x10)</button>
+      <button class="btn" id="btn-download" title="Open CSV in new tab">Open Sheet CSV</button>
+    </div>
+  </div>
+
+  <div id="loading">Please sign in to load data and show 3D tiles.</div>
+
+  <div id="container"></div>
+
+  <script>
+  // ---------- CONFIGURE THESE ----------
+  const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR9IRggEiSlt7tlzri1xloVw0iLjF7EukjzEoDTyCoZiBxbSo1tSf5msd-RoiUxg1R7XPQRMrBCrtap/pub?gid=954501970&single=true&output=csv";
+  const CLIENT_ID = "557801993386-p0b3mvm51hv63s5mo9954mntjn6qvk6u.apps.googleusercontent.com"; // also set this in the g_id_onload div above
+  // -------------------------------------
+
+  // helper to set client id on the runtime div
+  document.querySelector('#g_id_onload').setAttribute('data-client_id', CLIENT_ID);
+
+  // signin button fallback (for older browsers or manual click)
+  document.getElementById('login-btn').addEventListener('click', () => {
+    google.accounts.id.prompt(); // triggers auto prompt
+  });
+
+  // decode JWT credential quickly (we'll use a tiny decode)
+  function jwtDecode(token) {
+    try {
+      const payload = token.split('.')[1];
+      const json = atob(payload.replace(/-/g,'+').replace(/_/g,'/'));
+      return JSON.parse(decodeURIComponent(escape(json)));
+    } catch(e){
+      console.warn('jwt decode failed', e);
+      return {};
+    }
+  }
+
+  let items = []; // tile data array
+  // convenient parsed numbers
+  function parseNumber(str) {
+    if (!str && str !== 0) return 0;
+    return Number(String(str).replace(/[^0-9.-]+/g,'')) || 0;
+  }
+
+  // handle Google credential
+  async function handleCredentialResponse(response) {
+    const data = jwtDecode(response.credential);
+    document.getElementById('user-info').innerHTML = `
+      <img src="${data.picture||''}" width="28" style="vertical-align:middle;border-radius:50%;margin-right:8px;">
+      <strong>${data.name||data.email||'User'}</strong>
+    `;
+    document.getElementById('login-btn').style.display = 'none';
+    document.getElementById('controls').style.display = 'flex';
+    document.getElementById('loading').innerText = 'Signed in. Loading sheet data...';
+    await loadSheetAndBuild();
+  }
+
+  // Load sheet CSV, parse, create items
+  async function loadSheetAndBuild() {
+    try {
+      const resp = await fetch(SHEET_CSV_URL);
+      if (!resp.ok) throw new Error('Cannot fetch sheet CSV: ' + resp.status);
+      const text = await resp.text();
+      const rows = parseCSV(text);
+      if (!rows.length) {
+        document.getElementById('loading').innerText = 'Sheet empty or parse failed. Make sure CSV URL is correct and sheet is published/shared.';
+        return;
+      }
+
+      // Expected columns: Name, Title, NetWorth, Country, Company, Extra (adjust to your CSV)
+      // We'll normalize: pick first header names — show all fields in tile
+      items = rows.map((r, i) => {
+        // ensure consistent keys; copy row as-is
+        const net = parseNumber(r.NetWorth ?? r.networth ?? r.Net_Worth ?? r["Net Worth"] ?? r["NetWorth"] ?? r.net_worth ?? "");
+        return {
+          index: i,
+          raw: r,
+          name: r.Name || r.name || r.FullName || r["Full Name"] || ("Item " + (i+1)),
+          netWorth: net,
+          fields: r
+        };
+      });
+
+      // create 3D tiles from items
+      init3D();
+      createTilesFromData(items);
+      document.getElementById('loading').style.display = 'none';
+    } catch (err) {
+      console.error(err);
+      document.getElementById('loading').innerText = 'Failed to load sheet CSV. Error logged in console.';
+    }
+  }
+
+  // ---------- THREE.js CSS3D setup ----------
+  let camera, scene, renderer, controls;
+  let objects = [];
+  let targets = { table: [], sphere: [], helix: [], grid: [] };
+
+  function init3D() {
+    const container = document.getElementById('container');
+
+    camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 1, 10000);
+    camera.position.z = 3000;
+
+    scene = new THREE.Scene();
+
+    renderer = new THREE.CSS3DRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.domElement.style.position = 'absolute';
+    container.appendChild(renderer.domElement);
+
+    // CSS overlay (same size)
+    const cssOverlay = document.createElement('div');
+    cssOverlay.style.position = 'absolute';
+    cssOverlay.style.top = 0;
+    cssOverlay.style.left = 0;
+    cssOverlay.style.pointerEvents = 'none';
+    container.appendChild(cssOverlay);
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.minDistance = 500;
+    controls.maxDistance = 6000;
+
+    window.addEventListener('resize', onWindowResize);
+
+    animate();
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  // Create HTML element for each data item and wrap in CSS3DObject
+  function createTilesFromData(data) {
+    // clear old objects & scene
+    objects.forEach(obj => {
+      scene.remove(obj);
+      if (obj.element && obj.element.parentElement) obj.element.parentElement.remove();
+    });
+    objects = [];
+    targets = { table: [], sphere: [], helix: [], grid: [] };
+
+    const count = data.length;
+    data.forEach((d, i) => {
+      const element = document.createElement('div');
+      element.className = 'element';
+
+      // choose color by net worth
+      const net = d.netWorth;
+      let bgcolor = '#ff6b6b'; // red
+      if (net > 200000) bgcolor = '#66d98f'; // green
+      else if (net >= 100000) bgcolor = '#ffb86b'; // orange
+
+      element.style.background = `linear-gradient(180deg, ${bgcolor} 0%, rgba(255,255,255,0.06) 100%)`;
+
+      // build inner markup - show key fields
+      const title = document.createElement('div');
+      title.className = 'title';
+      title.innerText = d.name;
+
+      const subtitle = document.createElement('div');
+      subtitle.className = 'subtitle';
+      subtitle.innerText = `Net Worth: ${d.netWorth ? ('$' + d.netWorth.toLocaleString()) : 'N/A'}`;
+
+      // show other fields (limit 3)
+      const small = document.createElement('div');
+      small.className = 'small';
+      const keys = Object.keys(d.fields).filter(k => !['Name','name','Full Name','FullName','NetWorth','Net Worth','netWorth','net_worth'].includes(k)).slice(0,3);
+      small.innerHTML = keys.map(k => `<strong>${k}:</strong> ${d.fields[k]||''}`).join('<br>');
+
+      element.appendChild(title);
+      element.appendChild(subtitle);
+      element.appendChild(small);
+
+      // attach click handler (optional) - expand or open detail
+      element.addEventListener('click', () => {
+        alert(`${d.name}\nNet Worth: ${d.netWorth}\n\nFull data:\n${JSON.stringify(d.fields, null, 2)}`);
+      });
+
+      // CSS3DObject
+      const objectCSS = new THREE.CSS3DObject(element);
+      // initial random position
+      objectCSS.position.x = Math.random() * 4000 - 2000;
+      objectCSS.position.y = Math.random() * 4000 - 2000;
+      objectCSS.position.z = Math.random() * 4000 - 2000;
+      scene.add(objectCSS);
+
+      objects.push(objectCSS);
+    });
+
+    // Build targets
+    buildTableTargets(20, 10); // 20x10 table
+    buildSphereTargets();
+    buildDoubleHelixTargets();
+    buildGridTargets(5, 4, 10);
+
+    // Move to initial view: table
+    transform(targets.table, 2000);
+  }
+
+  // Target builders -------------------------
+  function buildTableTargets(cols, rows) {
+    // Table 20x10: spacing
+    const gapX = 160;
+    const gapY = 140;
+    const offsetX = (cols - 1) * gapX / 2;
+    const offsetY = (rows - 1) * gapY / 2;
+
+    for (let i = 0; i < objects.length; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols) % rows; // wrap after rows*cols, it's okay
+      const object = new THREE.Object3D();
+      object.position.x = (col * gapX) - offsetX;
+      object.position.y = - (row * gapY) + offsetY;
+      object.position.z = 0;
+      targets.table.push(object);
+    }
+  }
+
+  function buildSphereTargets() {
+    const vector = new THREE.Vector3();
+    const radius = 800;
+    for (let i = 0; i < objects.length; i++) {
+      const phi = Math.acos(-1 + (2 * i) / objects.length);
+      const theta = Math.sqrt(objects.length * Math.PI) * phi;
+
+      const object = new THREE.Object3D();
+
+      object.position.x = radius * Math.cos(theta) * Math.sin(phi);
+      object.position.y = radius * Math.sin(theta) * Math.sin(phi);
+      object.position.z = radius * Math.cos(phi);
+
+      vector.copy(object.position).multiplyScalar(2);
+      object.lookAt(vector);
+
+      targets.sphere.push(object);
+    }
+  }
+
+  function buildDoubleHelixTargets() {
+    // double helix: two interleaved helices offset by pi
+    const separation = 120; // radial distance from center
+    const turns = Math.ceil(objects.length / 10); // number of total turns
+    const helixSpacing = 40; // vertical spacing between tiles
+    for (let i = 0; i < objects.length; i++) {
+      const object = new THREE.Object3D();
+
+      // decide which helix (0 or 1)
+      const side = i % 2; // even -> helix A, odd -> helix B
+      const idx = Math.floor(i / 2);
+
+      const theta = idx * 0.5; // angle step
+      const x = Math.cos(theta + side * Math.PI) * separation;
+      const z = Math.sin(theta + side * Math.PI) * separation;
+      const y = -(idx * helixSpacing) + (objects.length / 2 * helixSpacing / 2);
+
+      object.position.set(x, y, z);
+
+      // rotate to face outward
+      const look = new THREE.Vector3(Math.cos(theta + side * Math.PI) * 2, y, Math.sin(theta + side * Math.PI) * 2);
+      object.lookAt(look);
+
+      targets.helix.push(object);
+    }
+  }
+
+  function buildGridTargets(gx, gy, gz) {
+    // 5 x 4 x 10 (gx x gy x gz)
+    const gap = 180;
+    const offsetX = (gx - 1) * gap / 2;
+    const offsetY = (gy - 1) * gap / 2;
+    const offsetZ = (gz - 1) * gap / 2;
+
+    for (let i = 0; i < objects.length; i++) {
+      const ix = i % gx;
+      const iy = Math.floor(i / gx) % gy;
+      const iz = Math.floor(i / (gx * gy)) % gz;
+
+      const object = new THREE.Object3D();
+      object.position.x = ix * gap - offsetX;
+      object.position.y = - (iy * gap) + offsetY;
+      object.position.z = iz * gap - offsetZ;
+      targets.grid.push(object);
+    }
+  }
+
+  // transform animation (tween-like)
+  function transform(targetsArray, duration) {
+    TWEEN && TWEEN.removeAll && TWEEN.removeAll(); // if present, remove previous
+    // we'll implement a lightweight tween using linear interpolation
+    const start = performance.now();
+    const fromPositions = objects.map(o => ({ x: o.position.x, y: o.position.y, z: o.position.z, q: o.quaternion.clone() }));
+    const toPositions = targetsArray.map(t => ({ x: t.position.x, y: t.position.y, z: t.position.z, q: t.quaternion ? t.quaternion.clone() : new THREE.Quaternion() }));
+
+    const len = objects.length;
+
+    function update() {
+      const now = performance.now();
+      const t = Math.min(1, (now - start) / duration);
+      for (let i = 0; i < len; i++) {
+        const obj = objects[i];
+        const from = fromPositions[i];
+        const to = toPositions[i] || toPositions[toPositions.length - 1]; // fallback
+        obj.position.x = from.x + (to.x - from.x) * easeInOutQuad(t);
+        obj.position.y = from.y + (to.y - from.y) * easeInOutQuad(t);
+        obj.position.z = from.z + (to.z - from.z) * easeInOutQuad(t);
+        // simple slerp for quaternion
+        obj.quaternion.slerpQuaternions(from.q, to.q || new THREE.Quaternion(), easeInOutQuad(t));
+      }
+      if (t < 1) {
+        requestAnimationFrame(update);
+      }
+    }
+    requestAnimationFrame(update);
+  }
+
+  function easeInOutQuad(t){ return t<0.5 ? 2*t*t : -1 + (4-2*t)*t; }
+
+  // animation loop
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  // --------- UI: buttons ----------
+  document.getElementById('btn-table').addEventListener('click', () => transform(targets.table, 1500));
+  document.getElementById('btn-sphere').addEventListener('click', () => transform(targets.sphere, 1500));
+  document.getElementById('btn-helix').addEventListener('click', () => transform(targets.helix, 1500));
+  document.getElementById('btn-grid').addEventListener('click', () => transform(targets.grid, 1500));
+
+  document.getElementById('btn-download').addEventListener('click', () => {
+    if (SHEET_CSV_URL && SHEET_CSV_URL !== 'https://docs.google.com/spreadsheets/d/e/2PACX-1vR9IRggEiSlt7tlzri1xloVw0iLjF7EukjzEoDTyCoZiBxbSo1tSf5msd-RoiUxg1R7XPQRMrBCrtap/pub?gid=954501970&single=true&output=csv') window.open(SHEET_CSV_URL, '_blank');
+    else alert('Set SHEET_CSV_URL in the source to open the CSV sheet.');
+  });
+
+  // If user already had Google session and auto prompt fires, we handle it via callback above.
+  </script>
+
+  <!-- NOTE: This demo does not include TWEEN.js; the transform uses a simple custom tween. -->
+</body>
+</html>
